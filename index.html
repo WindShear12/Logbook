@@ -656,6 +656,10 @@ table.plain{border-collapse:collapse;width:100%;font-size:13px}
       <div id="file-card-body"></div>
     </div>
     <div class="card">
+      <div class="card-head"><h3>Sync with GitHub</h3><span class="muted">One logbook shared between your devices</span></div>
+      <div id="gh-card-body"></div>
+    </div>
+    <div class="card">
       <div class="card-head"><h3>Aircraft</h3><span class="muted">Added automatically when you save an entry.</span></div>
       <div class="scroll"><table class="plain" id="aclist"></table></div>
     </div>
@@ -2129,9 +2133,181 @@ $("rv").addEventListener("change",()=>{S.rv=$("rv").checked;S.page=0;renderLog()
 $("open-fallback").addEventListener("change",async ev=>{const f=ev.target.files[0];ev.target.value="";if(!f)return;try{const data=JSON.parse(await f.text());loadData(data);L.savedAt=data.savedAt||"";await saveNow();toast("Opened "+f.name+". Saved in this browser.")}catch(e){toast(e.message||"That file couldn't be read.",true)}});
 $("restore-file").addEventListener("change",ev=>{const f=ev.target.files[0];ev.target.value="";if(f)restore(f)});
 
+/* ---------- Sync with a private GitHub repository ---------- */
+/* The logbook is saved as one JSON file in a private repository through GitHub's contents API.
+   Each device keeps its own copy (this browser) and an access key stored only on that device.
+   Changes from two devices are merged entry by entry against the last synced version. */
+const GH_API="https://api.github.com",GH_CFG="lb-gh";
+const GH={cfg:null,sha:null,base:null,state:"off",at:"",msg:"",busy:false,again:false,timer:null,lastPull:0};
+function ghLoadCfg(){try{const c=JSON.parse(localStorage.getItem(GH_CFG)||"null");if(c&&c.repo&&c.token)return c}catch(_){}return null}
+function ghSaveCfg(c){try{if(c)localStorage.setItem(GH_CFG,JSON.stringify(c));else localStorage.removeItem(GH_CFG)}catch(_){}}
+async function ghStore(){try{await idbSet("ghsync",{sha:GH.sha,base:GH.base?JSON.stringify(GH.base):null,repo:GH.cfg&&GH.cfg.repo,path:GH.cfg&&GH.cfg.path})}catch(_){}}
+function b64enc(str){const b=new TextEncoder().encode(str);let s="";for(let i=0;i<b.length;i+=0x8000)s+=String.fromCharCode.apply(null,b.subarray(i,i+0x8000));return btoa(s)}
+function b64dec(b64){const bin=atob(String(b64).replace(/\s/g,""));const u=new Uint8Array(bin.length);for(let i=0;i<bin.length;i++)u[i]=bin.charCodeAt(i);return new TextDecoder().decode(u)}
+const ghPath=()=>"/repos/"+GH.cfg.repo.split("/").map(encodeURIComponent).join("/")+"/contents/"+GH.cfg.path.split("/").map(encodeURIComponent).join("/");
+async function ghReq(method,url,body,cfg){
+  const c=cfg||GH.cfg;let r;
+  try{r=await fetch(GH_API+url,{method,cache:"no-store",headers:Object.assign({Authorization:"Bearer "+c.token,Accept:"application/vnd.github+json"},body?{"Content-Type":"application/json"}:{}),body:body?JSON.stringify(body):undefined})}
+  catch(e){const er=new Error("offline");er.offline=true;throw er}
+  return r;
+}
+function ghHttpErr(r,what){const e=new Error(what+" ("+r.status+")");e.status=r.status;return e}
+async function ghGet(){
+  const r=await ghReq("GET",ghPath());
+  if(r.status===404)return{missing:true};
+  if(!r.ok)throw ghHttpErr(r,"Couldn't read the logbook from GitHub");
+  const j=await r.json();let b64=j.encoding==="base64"&&j.content?j.content:null;
+  if(!b64){const r2=await ghReq("GET","/repos/"+GH.cfg.repo.split("/").map(encodeURIComponent).join("/")+"/git/blobs/"+j.sha);if(!r2.ok)throw ghHttpErr(r2,"Couldn't read the logbook from GitHub");b64=(await r2.json()).content}
+  let data;try{data=JSON.parse(b64dec(b64))}catch(_){const e=new Error("The file on GitHub isn't a logbook file.");e.fatal=true;throw e}
+  if(!data||data.format!=="casa-flight-crew-logbook"||!Array.isArray(data.entries)){const e=new Error("The file on GitHub isn't a logbook file.");e.fatal=true;throw e}
+  return{sha:j.sha,data};
+}
+async function ghPut(data,sha){
+  const dev=/iPhone|iPad/.test(navigator.userAgent)?"iPhone":/Android/.test(navigator.userAgent)?"Android":"PC";
+  const body={message:"Logbook saved from "+dev+" · "+new Date().toISOString().slice(0,16).replace("T"," ")+" UTC",content:b64enc(JSON.stringify(data,null,1))};if(sha)body.sha=sha;
+  const r=await ghReq("PUT",ghPath(),body);
+  if(!r.ok)throw ghHttpErr(r,"Couldn't save the logbook to GitHub");
+  return(await r.json()).content.sha;
+}
+/* stable comparison of logbook content, ignoring when it was saved */
+function ghKey(d){if(!d)return"";return JSON.stringify({s:d.settings||{},e:(d.entries||[]).slice().sort((a,b)=>a.id<b.id?-1:a.id>b.id?1:0)})}
+const hasLogData=d=>!!d&&((d.entries||[]).length>0||!!(d.settings&&d.settings.name));
+function merge3(base,loc,rem){
+  const m=x=>{const o={};((x&&x.entries)||[]).forEach(e=>{if(e&&e.id)o[e.id]=e});return o};
+  const B=m(base),Lo=m(loc),R=m(rem),out=[];
+  new Set(Object.keys(Lo).concat(Object.keys(R))).forEach(id=>{
+    const l=Lo[id],r=R[id],b=B[id],bs0=b?JSON.stringify(b):null;if(!l){if(!base||!b||bs0!==JSON.stringify(r))out.push(r);return}if(!r){if(base&&b&&bs0===JSON.stringify(l))return;out.push(l);return}
+    const ls=JSON.stringify(l),rs=JSON.stringify(r);if(ls===rs){out.push(l);return}
+    const bs=b?JSON.stringify(b):null;if(bs===ls){out.push(r);return}if(bs===rs){out.push(l);return}
+    out.push((r.updatedAt||"")>(l.updatedAt||"")?r:l)});
+  const ls=JSON.stringify(loc.settings||{}),rs=JSON.stringify(rem.settings||{}),bs=base?JSON.stringify(base.settings||{}):null;
+  let settings=loc.settings;
+  if(ls!==rs){if(!base)settings=hasLogData({settings:rem.settings})||!hasLogData({settings:loc.settings})?rem.settings:loc.settings;
+    else if(bs===ls)settings=rem.settings;else if(bs!==rs&&(rem.savedAt||"")>(loc.savedAt||""))settings=rem.settings}
+  out.sort((a,b)=>(a.date+(a.startTime||"")+a.id)<(b.date+(b.startTime||"")+b.id)?-1:1);
+  return{format:"casa-flight-crew-logbook",version:1,appVersion:"1.0-standalone",savedAt:new Date().toISOString(),settings,entries:out};
+}
+function ghSet(state,msg){GH.state=state;GH.msg=msg||"";if(state==="ok")GH.at=new Date().toISOString();setStatus()}
+function ghErr(e){
+  if(e&&e.offline){ghSet("offline");return}
+  const s=e&&e.status;
+  const msg=s===401?"GitHub didn't accept the access key. It may have expired.":s===403?"The access key can't save to this repository. Check it has Contents read and write access.":s===404?"The repository wasn't found, or the access key doesn't include it.":(e&&e.message)||"Something went wrong.";
+  ghSet("error",msg);
+}
+async function saveLocal(){
+  const snap=snapshot(),text=JSON.stringify(snap,null,1);
+  try{await idbSet("state",{savedAt:snap.savedAt,text})}catch(_){}
+  if(L.handle&&!L.needReconnect){try{const w=await L.handle.createWritable();await w.write(text);await w.close();L.lastFileWrite=snap.savedAt}catch(e){L.needReconnect=true;toast("Couldn't save to "+L.fileName+". Reconnect the file to keep saving to it.",true)}}
+  L.savedAt=snap.savedAt;
+}
+async function saveNow(){
+  if(L.saving){clearTimeout(L.timer);L.timer=setTimeout(saveNow,300);return}
+  L.saving=true;await saveLocal();L.dirty=false;L.saving=false;setStatus();ghSchedule();
+}
+function ghSchedule(){if(!GH.cfg)return;clearTimeout(GH.timer);GH.timer=setTimeout(()=>ghSync(),3000);if(GH.state!=="error")ghSet("pending")}
+async function applyMerged(merged){const scroll=window.scrollY;loadData(merged);await saveLocal();window.scrollTo(0,scroll)}
+async function ghSync(){
+  if(!GH.cfg)return;
+  if(GH.busy){GH.again=true;return}
+  GH.busy=true;clearTimeout(GH.timer);ghSet("saving");
+  try{
+    for(let attempt=0;attempt<3;attempt++){
+      const rem=await ghGet();GH.lastPull=Date.now();
+      let local=snapshot();
+      if(rem.missing){
+        if(!hasLogData(local)){ghSet("ok");break}
+        const sha=await ghPut(local,null);GH.sha=sha;GH.base=local;await ghStore();ghSet("ok");break;
+      }
+      if(rem.sha!==GH.sha){
+        const merged=merge3(GH.base,local,rem.data);
+        if(ghKey(merged)!==ghKey(local)){await applyMerged(merged);local=snapshot()}
+        GH.base=rem.data;GH.sha=rem.sha;await ghStore();
+      }
+      if(ghKey(local)===ghKey(GH.base)){ghSet("ok");break}
+      try{const sha=await ghPut(local,GH.sha);GH.sha=sha;GH.base=local;await ghStore();ghSet("ok");break}
+      catch(e){if(e.status===409||e.status===422)continue;throw e}
+    }
+  }catch(e){ghErr(e)}
+  finally{GH.busy=false;if(GH.again){GH.again=false;setTimeout(ghSync,500)}}
+}
+async function ghInit(){
+  GH.cfg=ghLoadCfg();if(!GH.cfg){setStatus();return}
+  try{const st=await idbGet("ghsync");if(st&&st.repo===GH.cfg.repo&&st.path===GH.cfg.path){GH.sha=st.sha||null;GH.base=st.base?JSON.parse(st.base):null}}catch(_){}
+  const ov=$("overlay");if(ov&&!ov.hidden&&$("modal").querySelector('[data-act="gh-connect"]'))closeModal();
+  await ghSync();
+}
+function ghConnectForm(){
+  const c=GH.cfg||{};
+  openModal('<div class="modal-head"><h2 id="modal-title">Sync with GitHub</h2><button class="btn sm" data-close>Cancel</button></div>'+
+    '<p>Saves your logbook to a private GitHub repository, so every device you connect shares the same logbook. Each save is kept as a version in the repository.</p>'+
+    '<form id="gh-form" class="fields wide" novalidate autocomplete="off">'+
+    '<div><label class="lab req" for="gh-repo">Private repository</label><input type="text" id="gh-repo" class="code" placeholder="username/repository" value="'+esc(c.repo||"")+'" autocapitalize="off" spellcheck="false"></div>'+
+    '<div><label class="lab" for="gh-path">File name</label><input type="text" id="gh-path" class="code" value="'+esc(c.path||"logbook.json")+'" autocapitalize="off" spellcheck="false"></div>'+
+    '<div class="span2"><label class="lab req" for="gh-token">Access key (fine-grained token)</label><input type="password" id="gh-token" class="code" placeholder="github_pat_…" autocomplete="off" autocapitalize="off" spellcheck="false"></div>'+
+    '</form><p class="small muted">The access key is kept only in this browser on this device, and is sent only to GitHub. Use a key limited to this one repository with Contents read and write access.</p>'+
+    '<p class="small" id="gh-msg" role="alert"></p><div class="row"><button class="btn primary" id="gh-go" type="button">Connect</button></div>');
+  $("gh-go").onclick=ghConnect;
+}
+async function ghConnect(){
+  const msg=$("gh-msg");let repo=$("gh-repo").value.trim().replace(/^https?:\/\/github\.com\//i,"").replace(/\.git$/i,"").replace(/\/+$/,"");
+  const path=($("gh-path").value.trim()||"logbook.json").replace(/^\/+/,""),token=$("gh-token").value.trim();
+  if(!/^[\w.-]+\/[\w.-]+$/.test(repo)){msg.textContent="Enter the repository as username/repository.";return}
+  if(!token){msg.textContent="Paste your access key.";return}
+  const cfg={repo,path,token};msg.textContent="Checking…";$("gh-go").disabled=true;
+  try{
+    const r=await ghReq("GET","/repos/"+repo.split("/").map(encodeURIComponent).join("/"),null,cfg);
+    if(r.status===401)throw new Error("GitHub didn't accept that access key.");
+    if(r.status===404||r.status===403)throw new Error("That repository wasn't found, or the access key doesn't include it.");
+    if(!r.ok)throw new Error("GitHub answered with an error ("+r.status+").");
+    const j=await r.json();
+    if(!j.private)throw new Error("This repository is public, so anyone could read your logbook. Make it private in GitHub, or use a private repository.");
+    if(j.permissions&&j.permissions.push===false)throw new Error("The access key can read this repository but can't save to it. Give it Contents read and write access.");
+  }catch(e){msg.textContent=e.offline?"You're offline. Connect when you have a signal.":e.message;$("gh-go").disabled=false;return}
+  GH.cfg=cfg;ghSaveCfg(cfg);GH.sha=null;GH.base=null;await ghStore();closeModal();toast("Connected to "+repo+". Syncing…");
+  await ghSync();
+  if(GH.state==="ok")toast("Synced with GitHub");
+}
+async function ghDisconnect(){clearTimeout(GH.timer);GH.cfg=null;GH.sha=null;GH.base=null;ghSaveCfg(null);try{await idbDel("ghsync")}catch(_){}GH.state="off";setStatus();toast("No longer syncing with GitHub. Your logbook is still saved on this device.")}
+function setStatus(){
+  const st=$("status"),b=$("persist-banner"),fc=$("file-card-body"),gc=$("gh-card-body");
+  let cls,txt,banner="";
+  const fileTxt=L.handle&&!L.needReconnect?(L.dirty||L.saving?"Saving to "+L.fileName+"…":"Saved to "+L.fileName+(L.savedAt?" · "+hhmm(L.savedAt):"")):"";
+  if(GH.cfg){
+    const at=GH.at?" · "+hhmm(GH.at):"";
+    if(GH.state==="error"){cls="warn";txt="GitHub sync stopped";banner='<strong>Your logbook isn\'t syncing with GitHub.</strong> '+esc(GH.msg)+' Changes are kept on this device. <button class="btn sm" data-act="gh-connect">Reconnect</button> <button class="btn sm" data-act="gh-sync">Try again</button>'}
+    else if(GH.state==="offline"){cls="warn";txt="Offline · saved on this device, will sync"}
+    else if(GH.state==="saving"||GH.state==="pending"||L.dirty||L.saving){cls="ok";txt="Syncing with GitHub…"}
+    else{cls="ok";txt="Synced with GitHub"+at}
+    if(L.handle&&L.needReconnect&&!banner)banner='<strong>Reconnect your logbook file.</strong> The browser needs your permission again to save to <span class="mono">'+esc(L.fileName)+'</span>. <button class="btn sm" data-act="reconnect">Reconnect '+esc(L.fileName)+"</button>";
+  }
+  else if(L.handle&&!L.needReconnect){cls="ok";txt=fileTxt}
+  else if(L.handle){cls="warn";txt="Not saving to "+L.fileName;banner='<strong>Reconnect your logbook file.</strong> The browser needs your permission again to save to <span class="mono">'+esc(L.fileName)+'</span>. Changes are kept in this browser until then. <button class="btn sm" data-act="reconnect">Reconnect '+esc(L.fileName)+"</button>"}
+  else{cls="warn";txt="Saved in this browser only"+(L.savedAt?" · "+hhmm(L.savedAt):"");banner=FS?'<strong>Your logbook is only saved in this browser.</strong> Sync it with GitHub, or link it to a file so every change is also saved to your PC. <button class="btn sm" data-act="gh-connect">Sync with GitHub</button> <button class="btn sm" data-act="create">Save to a new file</button> <button class="btn sm" data-act="open">Open my logbook file</button>':'<strong>Your logbook is only saved in this browser.</strong> Sync it with GitHub so it\'s kept safe and shared with your other devices. <button class="btn sm" data-act="gh-connect">Sync with GitHub</button>'}
+  st.className="status "+cls;st.innerHTML='<span class="dot"></span><span>'+esc(txt)+"</span>";
+  b.hidden=!banner;b.className="banner warn";b.innerHTML=banner;
+  if(fc)fc.innerHTML=(L.handle?'<p>Every change is also saved to <span class="mono">'+esc(L.fileName)+"</span>"+(L.needReconnect?" once you reconnect it":"")+". A copy is kept in this browser.</p>":"<p>Not linked to a file on this device. A copy is kept in this browser.</p>")+
+    '<div class="row">'+(FS?(L.handle&&L.needReconnect?'<button class="btn sm primary" type="button" data-act="reconnect">Reconnect</button>':"")+'<button class="btn sm" type="button" data-act="open">Open a logbook file</button><button class="btn sm" type="button" data-act="create">Save to a new file</button>'+(L.handle?'<button class="btn sm" type="button" data-act="unlink">Stop saving to this file</button>':""):'<button class="btn sm" type="button" data-act="open">Open a logbook or backup file</button>')+"</div>";
+  if(gc)gc.innerHTML=GH.cfg?'<p>Syncing with <span class="mono">'+esc(GH.cfg.repo+"/"+GH.cfg.path)+"</span>."+(GH.at?" Last synced "+esc(new Date(GH.at).toLocaleString("en-AU"))+".":"")+(GH.state==="error"?' <span class="warn-t">'+esc(GH.msg)+"</span>":"")+'</p><p class="small muted">Changes sync a few seconds after you make them, and when you come back to the logbook. If two devices change the logbook, the changes are combined entry by entry.</p><div class="row"><button class="btn sm primary" type="button" data-act="gh-sync">Sync now</button><button class="btn sm" type="button" data-act="gh-connect">Change repository or key</button><button class="btn sm" type="button" data-act="gh-off">Stop syncing on this device</button></div>'
+    :'<p>Keep your logbook in a private GitHub repository so your PC and iPhone share it. Each save is kept as a version, so the history of every change is preserved.</p><div class="row"><button class="btn sm primary" type="button" data-act="gh-connect">Connect to GitHub</button></div>';
+}
+function welcome(){
+  openModal('<div class="modal-head"><h2 id="modal-title">Set up your logbook</h2></div>'+
+    '<p>If your logbook already syncs with GitHub, connect to it here and it will load.</p><div class="row"><button class="btn primary" data-act="gh-connect">Connect to GitHub</button></div>'+
+    (FS?'<p>Or keep it in a file on this PC. Every change is saved to that file automatically.</p><div class="row"><button class="btn" data-act="open">Open my logbook file</button><button class="btn" data-act="create">Create a new logbook file</button></div>'
+      :'<div class="row"><button class="btn" data-act="open">Open a logbook or backup file</button></div>')+
+    '<p class="small"><button class="btn link" data-close>Start with an empty logbook in this browser</button></p>');
+}
+document.addEventListener("click",ev=>{const a=ev.target.closest("[data-act]");if(!a)return;const act=a.dataset.act;
+  if(act==="gh-connect")ghConnectForm();else if(act==="gh-sync")ghSync();else if(act==="gh-off")ghDisconnect()});
+document.addEventListener("visibilitychange",()=>{if(!GH.cfg)return;
+  if(document.hidden){if(GH.state==="pending"||L.dirty){clearTimeout(L.timer);clearTimeout(GH.timer);(L.dirty?saveNow():Promise.resolve()).then(ghSync)}}
+  else if(Date.now()-GH.lastPull>20000)ghSync()});
+setInterval(()=>{if(GH.cfg&&!document.hidden&&!GH.busy&&Date.now()-GH.lastPull>110000)ghSync()},30000);
+window.addEventListener("online",()=>{if(GH.cfg)ghSync()});
+
 resetForm();renderAll(true);
 try{const v=localStorage.getItem("lb-view");if(v&&v!=="new")go(v)}catch(_){}
-localConnect();
+localConnect().then(ghInit);
 })();
 </script>
 
